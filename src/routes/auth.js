@@ -19,6 +19,17 @@ const router = Router();
 // In-flight auth sessions keyed by processId (temporary, cleared after finish)
 const authSessions = new Map();
 
+// Kaspi rejects requests whose emulated app version is below the current
+// minimum by returning a 200 with an OldVersionToUpdate alert. Detect it and
+// surface a proper 422 so the caller doesn't keep retrying or store empty creds.
+function detectOldVersion(body) {
+  const code = body?.view?.onOpenAlarm?.error?.code || body?.data?.error?.code;
+  if (code === 'OldVersionToUpdate') {
+    return body?.view?.onOpenAlarm?.error?.label || 'Обновите приложение, чтобы войти';
+  }
+  return null;
+}
+
 // ═══════════════════════════════════════════════════
 //  Step 1 — Init entrance (get processId)
 // ═══════════════════════════════════════════════════
@@ -59,6 +70,17 @@ router.post('/init', async (req, res) => {
     if (ut) session.userToken = ut;
 
     const body = await resp.json();
+
+    const stale = detectOldVersion(body);
+    if (stale) {
+      return res.status(422).json({
+        error: 'OldVersionToUpdate',
+        message: `${stale}. Bump APP.version/APP.build in src/config.js (or KASPI_APP_VERSION env) to match the current Kaspi Pay App Store release.`,
+        appVersion: APP.version,
+        appBuild: APP.build,
+      });
+    }
+
     if (body.meta?.pId) {
       session.processId = body.meta.pId;
       authSessions.set(session.processId, session);
@@ -103,6 +125,17 @@ router.post('/send-phone', async (req, res) => {
     if (ut) session.userToken = ut;
 
     const body = await resp.json();
+
+    const stale = detectOldVersion(body);
+    if (stale) {
+      return res.status(422).json({
+        error: 'OldVersionToUpdate',
+        message: `${stale}. Bump APP.version/APP.build in src/config.js (or KASPI_APP_VERSION env) to match the current Kaspi Pay App Store release.`,
+        appVersion: APP.version,
+        appBuild: APP.build,
+      });
+    }
+
     const smsSent = body.view?.code === 'EnterOtp';
 
     res.json({ success: smsSent, processId: session.processId, desc: body.data?.desc, view: body.view?.code, body });

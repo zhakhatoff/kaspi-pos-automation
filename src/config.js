@@ -91,11 +91,15 @@ export const KASPI_QRPAY_URL = 'https://qrpay.kaspi.kz';
 // These values are hardcoded intentionally: the Kaspi API validates device
 // parameters and may reject requests with arbitrary or unknown values.
 
+// Kaspi force-rejects older app versions with OldVersionToUpdate. Bump these
+// to match the current Kaspi Pay (kz.kaspi.business) release on the App Store
+// whenever the API starts returning OldVersionToUpdate. Overridable via env so
+// we can fix prod without a code redeploy.
 export const APP = {
-  version: '4.105',
-  build: '1070',
+  version: process.env.KASPI_APP_VERSION || '4.110.1',
+  build: process.env.KASPI_APP_BUILD || '1100',
   platform: 'iOS',
-  platformVer: '18.5',
+  platformVer: process.env.KASPI_APP_PLATFORM_VER || '18.5',
   locale: 'ru-RU',
   model: 'iPhone17,3',
   brand: 'Apple',
