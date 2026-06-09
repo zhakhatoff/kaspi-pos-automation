@@ -58,22 +58,39 @@ router.post('/create', async (req, res) => {
       body: JSON.stringify({ PhoneNumber: phoneNumber, Amount: Number(amount), Comment: comment || '' }),
     });
     const kaspiResponse = await resp.json();
-    const d = kaspiResponse.Data;
-    if (d && d.Id && d.Status === 'RemotePaymentCreated') {
+    const d = kaspiResponse.Data || {};
+    // Kaspi changed the response shape mid-2026: instead of returning
+    // {Id, Status: 'RemotePaymentCreated', Amount, ...} the remote/create
+    // endpoint now returns {QrOperationId} only. The old condition
+    // (d.Id && d.Status === 'RemotePaymentCreated') silently skipped
+    // trackPayment for every new push-invoice, so polling never started
+    // and downstream consumers never got the payment.success webhook.
+    //
+    // Accept both shapes: take whichever ID field exists, infer the
+    // polling type from which field came back (QrOperationId → QR status
+    // endpoint /v02/kaspi-qr/status, legacy Id → /v02/remote/details).
+    const operationId = d.Id || d.QrOperationId || d.OperationId;
+    if (operationId) {
+      const pollType = (d.Id && !d.QrOperationId) ? 'invoice' : 'qr';
       trackPayment(
-        d.Id,
-        'invoice',
+        operationId,
+        pollType,
         {
           tokenSN: req.session.tokenSN,
           vtokenSecret: req.headers['x-vtoken-secret'],
           profileId: req.session.profileId,
         },
         {
-          amount: d.Amount,
-          clientMobile: d.ClientMobile,
+          amount: d.Amount || Number(amount),
+          clientMobile: d.ClientMobile || phoneNumber,
           receiptUrl: d.ReceiptUrl,
           orderNumber: d.OrderNumber,
         },
+      );
+    } else {
+      console.warn(
+        '[invoice] Kaspi response had no operation id; nothing to poll:',
+        JSON.stringify(kaspiResponse).slice(0, 300),
       );
     }
     res.json(kaspiResponse);
