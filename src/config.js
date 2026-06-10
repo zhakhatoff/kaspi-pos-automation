@@ -88,26 +88,28 @@ export const KASPI_MTOKEN_URL = 'https://mtoken.kaspi.kz';
 export const KASPI_QRPAY_URL = 'https://qrpay.kaspi.kz';
 
 // ─── App version & device constants ───
-// These values are hardcoded intentionally: the Kaspi API validates device
-// parameters and may reject requests with arbitrary or unknown values.
+// Defaults match a known-good Kaspi Pay client. Override via .env if needed.
+// ⚠️ The Kaspi API validates these parameters and may reject unknown values.
 
 // Kaspi force-rejects older app versions with OldVersionToUpdate. Bump these
 // to match the current Kaspi Pay (kz.kaspi.business) release on the App Store
 // whenever the API starts returning OldVersionToUpdate. Overridable via env so
 // we can fix prod without a code redeploy.
 export const APP = {
-  version: process.env.KASPI_APP_VERSION || '4.110.1',
-  build: process.env.KASPI_APP_BUILD || '1100',
-  platform: 'iOS',
-  platformVer: process.env.KASPI_APP_PLATFORM_VER || '18.5',
-  locale: 'ru-RU',
-  model: 'iPhone17,3',
-  brand: 'Apple',
-  deviceName: 'iPhone',
-  screenW: '393.0',
-  screenH: '852.0',
-  cfNetwork: 'CFNetwork/3826.500.131',
-  darwin: 'Darwin/24.5.0',
+  // Accept both upstream's APP_* names and our legacy KASPI_APP_* names
+  // so existing Railway envs keep working without a manual rename.
+  version: process.env.APP_VERSION || process.env.KASPI_APP_VERSION || '4.111',
+  build: process.env.APP_BUILD || process.env.KASPI_APP_BUILD || '1101',
+  platform: process.env.APP_PLATFORM || 'iOS',
+  platformVer: process.env.APP_PLATFORM_VER || process.env.KASPI_APP_PLATFORM_VER || '18.5',
+  locale: process.env.APP_LOCALE || 'ru-RU',
+  model: process.env.APP_MODEL || 'iPhone17,3',
+  brand: process.env.APP_BRAND || 'Apple',
+  deviceName: process.env.APP_DEVICE_NAME || 'iPhone',
+  screenW: process.env.APP_SCREEN_W || '393.0',
+  screenH: process.env.APP_SCREEN_H || '852.0',
+  cfNetwork: process.env.APP_CFNETWORK || 'CFNetwork/3826.500.131',
+  darwin: process.env.APP_DARWIN || 'Darwin/24.5.0',
 };
 
 export const UA_NATIVE = `Kaspi%20Pay/${APP.build} ${APP.cfNetwork} ${APP.darwin}`;
