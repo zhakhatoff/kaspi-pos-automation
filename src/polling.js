@@ -100,8 +100,32 @@ const INVOICE_FINAL_STATUSES = {
   Expired: 'payment.expired',
 };
 
-const QR_INTERMEDIATE = new Set(['QrTokenCreated', 'Wait']);
-const INVOICE_INTERMEDIATE = new Set(['RemotePaymentCreated']);
+// Kaspi mid-2026 merged remote-invoice into the QR pipeline: operations
+// now come back with QrOperationId (we track them as type='qr') but their
+// status flow still steps through 'RemotePaymentCreated' (push delivered
+// to the recipient, awaiting their tap on "Оплатить"). The old QR set
+// only covered the bare QR-token states, so RemotePaymentCreated fell
+// through resolveEvent's default and emitted payment.failed almost
+// immediately after invoice/create — every push died at "first status
+// change" before the customer ever saw the prompt.
+//
+// Treat any not-yet-final state as intermediate. The polling loop just
+// keeps watching until a real terminal status (Processed / Canceled* /
+// Expired / etc.) actually arrives.
+const QR_INTERMEDIATE = new Set([
+  'QrTokenCreated',
+  'Wait',
+  'WaitForRemotePayment',
+  'WaitingForPayment',
+  'RemotePaymentCreated',
+]);
+const INVOICE_INTERMEDIATE = new Set([
+  'RemotePaymentCreated',
+  'QrTokenCreated',
+  'Wait',
+  'WaitForRemotePayment',
+  'WaitingForPayment',
+]);
 
 // ─── Track a payment ───
 
@@ -250,11 +274,21 @@ const processRetries = async () => {
 const resolveEvent = (type, status) => {
   if (type === 'qr') {
     if (QR_INTERMEDIATE.has(status)) return null;
-    return QR_FINAL_STATUSES[status] || 'payment.failed';
+    const mapped = QR_FINAL_STATUSES[status];
+    if (mapped) return mapped;
   } else {
     if (INVOICE_INTERMEDIATE.has(status)) return null;
-    return INVOICE_FINAL_STATUSES[status] || 'payment.failed';
+    const mapped = INVOICE_FINAL_STATUSES[status];
+    if (mapped) return mapped;
   }
+  // Unknown status — log and keep polling instead of guessing failure.
+  // Kaspi occasionally introduces new intermediate states (the
+  // RemotePaymentCreated incident was caused by exactly this default).
+  logger.warn(
+    'POLLING',
+    `Unknown ${type} status '${status}' — keeping polling instead of emitting failure`,
+  );
+  return null;
 };
 
 // ─── Poll cycle ───
