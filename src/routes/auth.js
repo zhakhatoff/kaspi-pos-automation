@@ -13,11 +13,40 @@ import {
   decryptSecret,
 } from '../crypto.js';
 import { loggedFetch, extractUserToken, entranceCookie, generateUUID, nowISO } from '../helpers.js';
+import {
+  SESSION_COOKIE_NAME,
+  buildSessionCookie,
+  serializeCookie,
+  sessionCookieOptions,
+} from '../cookies.js';
+import { readSession } from '../authMiddleware.js';
+
+function setSessionCookie(res, { tokenSN, vtokenSecret, profileId }) {
+  const blob = buildSessionCookie({ tokenSN, vtokenSecret, profileId });
+  res.setHeader('Set-Cookie', serializeCookie(SESSION_COOKIE_NAME, blob, sessionCookieOptions()));
+}
+
+function clearSessionCookie(res) {
+  res.setHeader(
+    'Set-Cookie',
+    serializeCookie(SESSION_COOKIE_NAME, '', { ...sessionCookieOptions({ maxAge: 0 }) }),
+  );
+}
 
 const router = Router();
 
 // In-flight auth sessions keyed by processId (temporary, cleared after finish)
 const authSessions = new Map();
+const AUTH_SESSION_TTL_MS = 15 * 60 * 1000;
+
+// Reap abandoned auth flows (no OTP entered, doFinish threw, etc.) so the
+// Map cannot grow past the intended in-flight window.
+setInterval(() => {
+  const cutoff = Date.now() - AUTH_SESSION_TTL_MS;
+  for (const [pid, s] of authSessions) {
+    if ((s.createdAt || 0) < cutoff) authSessions.delete(pid);
+  }
+}, 60 * 1000).unref();
 
 // Kaspi rejects requests whose emulated app version is below the current
 // minimum by returning a 200 with an OldVersionToUpdate alert. Detect it and
@@ -83,6 +112,7 @@ router.post('/init', async (req, res) => {
 
     if (body.meta?.pId) {
       session.processId = body.meta.pId;
+      session.createdAt = Date.now();
       authSessions.set(session.processId, session);
     }
 
@@ -179,7 +209,13 @@ router.post('/verify-otp', async (req, res) => {
     if (body.data?.type === 'kpDeviceRegistration' || body.view?.code === 'KPMobileCall') {
       // OTP verified — automatically call finish
       const finishResult = await doFinish(session);
-      authSessions.delete(processId);
+      if (finishResult.tokenSN && finishResult.vtokenSecret) {
+        setSessionCookie(res, {
+          tokenSN: finishResult.tokenSN,
+          vtokenSecret: finishResult.vtokenSecret,
+          profileId: finishResult.profileId,
+        });
+      }
       res.json({
         success: true,
         processId: session.processId,
@@ -193,6 +229,11 @@ router.post('/verify-otp', async (req, res) => {
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
+  } finally {
+    // Always release the in-flight processId — successful finish, failed
+    // OTP, and thrown errors alike. Keeping it around leaks memory and
+    // lets replay attempts reuse a half-completed session.
+    authSessions.delete(processId);
   }
 });
 
@@ -343,7 +384,13 @@ async function doFinish(session) {
 // ═══════════════════════════════════════════════════
 
 router.post('/refresh', async (req, res) => {
-  const { tokenSN, vtokenSecret, organizationId } = req.body;
+  // Prefer credentials from the session cookie; fall back to body for the
+  // deprecated pre-cookie clients. TODO(remove with header fallback).
+  const reqBody = req.body || {};
+  const fromSession = readSession(req);
+  const tokenSN = fromSession.tokenSN || reqBody.tokenSN;
+  const vtokenSecret = fromSession.vtokenSecret || reqBody.vtokenSecret;
+  const organizationId = reqBody.organizationId;
   if (!tokenSN) return res.status(400).json({ error: 'tokenSN required' });
   if (!vtokenSecret) return res.status(400).json({ error: 'vtokenSecret required' });
 
@@ -452,12 +499,17 @@ router.post('/refresh', async (req, res) => {
           'X-SV': '2',
           'X-Kb-Client-Ip': '192.168.1.96',
           'X-PkTag': DEVICE.pkTag,
-          'X-PI': session.profileId || '',
           'X-SU': computeXSU(orgUrl),
-          'X-SH':
-            'url,X-Kb-Client-Ip,X-Time,X-App-Ver,X-SV,X-Locale,X-App-Bld,X-Install-ID,X-Kb-TokenSn,X-S,X-Kb-TokenSnMac,X-Call',
           'X-Request-ID': generateUUID(),
         };
+        // Mirror doFinish: include X-PI in headers AND X-SH only when
+        // profileId is actually available. Sending an empty X-PI that is
+        // not covered by X-SH breaks the signature and drops org context.
+        const piValue = session.profileId != null ? String(session.profileId) : '';
+        orgHeaders['X-SH'] = piValue
+          ? 'url,X-Kb-Client-Ip,X-App-Bld,X-S,X-Kb-TokenSn,X-Time,X-App-Ver,X-Kb-TokenSnMac,X-Call,X-PI,X-Install-ID,X-Locale,X-SV'
+          : 'url,X-Kb-Client-Ip,X-Time,X-App-Ver,X-SV,X-Locale,X-App-Bld,X-Install-ID,X-Kb-TokenSn,X-S,X-Kb-TokenSnMac,X-Call';
+        if (piValue) orgHeaders['X-PI'] = piValue;
         orgHeaders['X-Sign'] = computeXSign(orgUrl, orgHeaders, orgHeaders['X-SH']);
 
         const orgResp = await loggedFetch(orgUrl, {
@@ -498,6 +550,11 @@ router.post('/refresh', async (req, res) => {
         console.error('Refresh org-context-otp error:', e.message);
       }
 
+      setSessionCookie(res, {
+        tokenSN: newTokenSN,
+        vtokenSecret: newVtokenSecret,
+        profileId: session.profileId,
+      });
       res.json({
         success: true,
         tokenSN: newTokenSN,
@@ -524,16 +581,12 @@ router.post('/refresh', async (req, res) => {
   }
 });
 
-// ─── Session status (client sends tokenSN) ───
-
-router.post('/session', (req, res) => {
-  const { tokenSN } = req.body || {};
-  res.json({ authenticated: !!tokenSN, tokenSN });
-});
-
 // ─── Logout ───
+// Clears the HttpOnly session cookie. /api/auth/session was removed —
+// callers should hit /api/session/check to probe an existing session.
 
 router.post('/logout', (req, res) => {
+  clearSessionCookie(res);
   res.json({ success: true });
 });
 

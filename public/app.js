@@ -16,26 +16,33 @@ let qrOperationId = null;
 const $ = (id) => document.getElementById(id);
 const digitsOnly = (str) => str.replace(/\D/g, '');
 
-const getSession = () => {
-  try {
-    return JSON.parse(localStorage.getItem('kaspi_session') || '{}');
-  } catch {
-    return {};
-  }
+// HTML escape for anything from Kaspi that lands in innerHTML.
+const ESCAPE_MAP = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;',
+  '`': '&#96;',
 };
+const escapeHtml = (v) =>
+  String(v == null ? '' : v).replace(/[&<>"'`]/g, (ch) => ESCAPE_MAP[ch]);
 
-const sessionHeaders = () => {
-  const s = getSession();
-  const h = {};
-  if (s.tokenSN) h['X-Token-SN'] = s.tokenSN;
-  if (s.profileId) h['X-Profile-ID'] = String(s.profileId);
-  if (s.vtokenSecret) h['X-Vtoken-Secret'] = s.vtokenSecret;
-  return h;
+// Only allow http(s) URLs; anything else returns '' so we never emit a
+// javascript: href into the DOM.
+const safeHttpUrl = (u) => {
+  if (!u) return '';
+  try {
+    const parsed = new URL(String(u), window.location.href);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return parsed.href;
+    }
+  } catch {}
+  return '';
 };
 
 const apiFetch = async (path, opts = {}) => {
-  opts.headers = { ...sessionHeaders(), ...(opts.headers || {}) };
-  const resp = await fetch(API + path, opts);
+  const resp = await fetch(API + path, { credentials: 'same-origin', ...opts });
   return resp.json();
 };
 
@@ -46,21 +53,12 @@ const apiPost = (path, body) =>
     ...(body !== undefined && { body: JSON.stringify(body) }),
   });
 
-// ─── Session Persistence (localStorage) ───
+// ─── Session ───
+// Credentials live in an HttpOnly cookie set by /api/auth/verify-otp; the
+// client never sees them. We only track "is there an active session?" for
+// the UI, and re-check on load.
 
-const SESSION_KEY = 'kaspi_session';
-
-const saveSession = (data) => {
-  let prev = {};
-  try {
-    prev = JSON.parse(localStorage.getItem(SESSION_KEY) || '{}');
-  } catch {}
-  const merged = { ...prev, ...data };
-  if (data.phone) merged.phoneNumber = data.phone;
-  localStorage.setItem(SESSION_KEY, JSON.stringify(merged));
-};
-
-const clearSession = () => localStorage.removeItem(SESSION_KEY);
+let sessionActive = false;
 
 const checkSession = async () => {
   try {
@@ -72,30 +70,22 @@ const checkSession = async () => {
   }
 };
 
-const tryRestoreSession = async () => {
-  const session = getSession();
-  if (session.tokenSN && session.vtokenSecret) {
-    showMainScreen(session);
-    // Verify session is still active on the server
-    const result = await checkSession();
-    if (!result.active) {
-      clearSession();
-      $('mainScreen').classList.add('hidden');
-      $('authScreen').classList.remove('hidden');
-      setAuthStep(1);
-      showAuthMsg(result.error || 'Сессия истекла. Войдите заново.', 'err');
-      return false;
-    }
-    return true;
-  }
-  clearSession();
-  return false;
+const showAuthScreen = () => {
+  $('mainScreen').classList.add('hidden');
+  $('authScreen').classList.remove('hidden');
+  setAuthStep(1);
 };
 
-const updateRefreshAuthBtn = () => {
-  const session = getSession();
-  const btn = $('btnRefreshAuth');
-  if (btn) btn.classList.toggle('hidden', !session.tokenSN || !session.vtokenSecret);
+const tryRestoreSession = async () => {
+  const result = await checkSession();
+  if (result.active) {
+    sessionActive = true;
+    showMainScreen(null);
+    return true;
+  }
+  sessionActive = false;
+  showAuthScreen();
+  return false;
 };
 
 const formatPhone = (digits) => {
@@ -116,10 +106,9 @@ const attachPhoneFormatter = (el) => {
 };
 
 window.addEventListener('DOMContentLoaded', () => {
-  updateRefreshAuthBtn();
-  tryRestoreSession();
   attachPhoneFormatter($('phoneInput'));
   attachPhoneFormatter($('clientPhone'));
+  tryRestoreSession();
 });
 
 // ─── Auth UI Helpers ───
@@ -197,8 +186,8 @@ const verifyOtp = async () => {
   try {
     const resp = await apiPost('/api/auth/verify-otp', { otp, processId: authProcessId });
     if (resp.success && resp.step === 'finished') {
-      saveSession(resp);
       authProcessId = null;
+      sessionActive = true;
       showMainScreen(resp);
     } else {
       showAuthMsg(`Неверный код или ошибка: ${resp.body?.data?.desc || JSON.stringify(resp.body)}`, 'err');
@@ -224,9 +213,10 @@ const showMainScreen = (data) => {
 };
 
 const logout = async () => {
-  const { tokenSN } = getSession();
-  clearSession();
-  await apiPost('/api/auth/logout', { tokenSN });
+  try {
+    await apiPost('/api/auth/logout');
+  } catch {}
+  sessionActive = false;
   $('mainScreen').classList.add('hidden');
   $('authScreen').classList.remove('hidden');
   $('phoneInput').value = '';
@@ -259,7 +249,7 @@ const statusBadge = (status) => {
     RemotePaymentExpired: ['Истёк', 'expired'],
   };
   const [label, cls] = map[status] || [status, 'pending'];
-  return `<span class="badge badge-${cls}">${label}</span>`;
+  return `<span class="badge badge-${cls}">${escapeHtml(label)}</span>`;
 };
 
 const renderDetails = (data, containerId) => {
@@ -270,8 +260,8 @@ const renderDetails = (data, containerId) => {
     .map(
       ({ Title, Data, IsBold }) =>
         `<div class="detail-row">
-        <span class="detail-label">${Title}</span>
-        <span class="detail-value" style="${IsBold ? 'font-weight:700' : ''}">${Data}</span>
+        <span class="detail-label">${escapeHtml(Title)}</span>
+        <span class="detail-value" style="${IsBold ? 'font-weight:700' : ''}">${escapeHtml(Data)}</span>
       </div>`,
     )
     .join('');
@@ -432,7 +422,8 @@ const startQrCountdown = (seconds) => {
 const generateQrSvg = (text, size = 256) => {
   // Simple QR placeholder using a data URL image via an API
   // For production, use a proper QR library; here we use a public API fallback
-  return `<img src="https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&data=${encodeURIComponent(text)}" alt="QR Code" style="max-width:100%;border-radius:8px;">`;
+  const src = `https://api.qrserver.com/v1/create-qr-code/?size=${size}x${size}&data=${encodeURIComponent(text)}`;
+  return `<img src="${escapeHtml(src)}" alt="QR Code" style="max-width:100%;border-radius:8px;">`;
 };
 
 const createQr = async () => {
@@ -524,14 +515,14 @@ const loadHistory = async () => {
     list.innerHTML = ops
       .map(
         (op) => `
-        <div class="op-item" onclick="showHistoryDetail(${op.Id})">
+        <div class="op-item" onclick="showHistoryDetail(${Number(op.Id)})">
           <div class="op-row">
             <div>
-              <div class="op-name">${op.ClientName || op.ClientShortName || '—'}</div>
-              <div class="op-date">${new Date(op.OrderRegDate).toLocaleString('ru')}</div>
+              <div class="op-name">${escapeHtml(op.ClientName || op.ClientShortName || '—')}</div>
+              <div class="op-date">${escapeHtml(new Date(op.OrderRegDate).toLocaleString('ru'))}</div>
             </div>
             <div style="text-align:right;">
-              <div class="op-amount">${op.Amount}</div>
+              <div class="op-amount">${escapeHtml(op.Amount)}</div>
               ${statusBadge(op.Status)}
             </div>
           </div>
@@ -593,8 +584,8 @@ const loadSales = async () => {
     // Stats
     const s = data.Statistic || {};
     stats.innerHTML = `<div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
-      <div style="background:#e8f5e9;padding:8px 14px;border-radius:10px;text-align:center;"><div style="font-size:12px;color:#2e7d32;">Продажи</div><div style="font-weight:700;color:#2e7d32;">${s.SalesAmount ?? 0} ₸</div><div style="font-size:11px;color:#888;">${s.SalesCount ?? 0} шт</div></div>
-      <div style="background:#ffebee;padding:8px 14px;border-radius:10px;text-align:center;"><div style="font-size:12px;color:#c62828;">Возвраты</div><div style="font-weight:700;color:#c62828;">${s.ReturnsAmount ?? 0} ₸</div><div style="font-size:11px;color:#888;">${s.ReturnsCount ?? 0} шт</div></div>
+      <div style="background:#e8f5e9;padding:8px 14px;border-radius:10px;text-align:center;"><div style="font-size:12px;color:#2e7d32;">Продажи</div><div style="font-weight:700;color:#2e7d32;">${escapeHtml(s.SalesAmount ?? 0)} ₸</div><div style="font-size:11px;color:#888;">${escapeHtml(s.SalesCount ?? 0)} шт</div></div>
+      <div style="background:#ffebee;padding:8px 14px;border-radius:10px;text-align:center;"><div style="font-size:12px;color:#c62828;">Возвраты</div><div style="font-weight:700;color:#c62828;">${escapeHtml(s.ReturnsAmount ?? 0)} ₸</div><div style="font-size:11px;color:#888;">${escapeHtml(s.ReturnsCount ?? 0)} шт</div></div>
     </div>`;
     // Operations list
     const dailySets = data.DailySets || [];
@@ -604,19 +595,19 @@ const loadSales = async () => {
     }
     let html = '';
     for (const day of dailySets) {
-      html += `<div style="font-size:13px;color:#888;margin:12px 0 4px;font-weight:600;">${day.Date || ''}</div>`;
+      html += `<div style="font-size:13px;color:#888;margin:12px 0 4px;font-weight:600;">${escapeHtml(day.Date || '')}</div>`;
       for (const op of day.Operations || []) {
         const isReturn = op.OperationType === 1;
         const sign = isReturn ? '+' : '';
         const color = isReturn ? '#c62828' : '#1a1a1a';
-        html += `<div class="op-item" onclick="showSalesDetail(${op.Id}, ${op.OperationMethod || 0})">
+        html += `<div class="op-item" onclick="showSalesDetail(${Number(op.Id)}, ${Number(op.OperationMethod || 0)})">
           <div class="op-row">
             <div>
-              <div class="op-name">${op.ClientName || op.ClientShortName || '—'}</div>
-              <div class="op-date">${op.Time || ''}</div>
+              <div class="op-name">${escapeHtml(op.ClientName || op.ClientShortName || '—')}</div>
+              <div class="op-date">${escapeHtml(op.Time || '')}</div>
             </div>
             <div style="text-align:right;">
-              <div class="op-amount" style="color:${color};">${sign}${op.Amount} ₸</div>
+              <div class="op-amount" style="color:${color};">${sign}${escapeHtml(op.Amount)} ₸</div>
             </div>
           </div>
         </div>`;
@@ -642,24 +633,28 @@ const showSalesDetail = async (id, operationMethod) => {
     const resp = await apiPost('/api/history/details', { id, operationMethod: operationMethod || 0 });
     const d = resp.Data || {};
     let rows = '';
+    const receiptHref = safeHttpUrl(d.ReceiptUrl);
     const fields = [
-      ['Сумма', d.Amount ? `${d.Amount} ₸` : null],
-      ['Клиент', d.ClientName || d.ClientShortName],
-      ['Дата', d.OrderRegDate ? new Date(d.OrderRegDate).toLocaleString('ru') : null],
-      ['Статус', d.StatusDescription],
-      ['Доступно к возврату', d.AvailableReturnAmount != null ? `${d.AvailableReturnAmount} ₸` : null],
-      ['Тип возврата', d.PossibleReturnType],
-      ['Чек', d.ReceiptUrl ? `<a href="${d.ReceiptUrl}" target="_blank">Открыть</a>` : null],
+      ['Сумма', d.Amount ? `${escapeHtml(d.Amount)} ₸` : null],
+      ['Клиент', escapeHtml(d.ClientName || d.ClientShortName || '') || null],
+      ['Дата', d.OrderRegDate ? escapeHtml(new Date(d.OrderRegDate).toLocaleString('ru')) : null],
+      ['Статус', escapeHtml(d.StatusDescription || '') || null],
+      [
+        'Доступно к возврату',
+        d.AvailableReturnAmount != null ? `${escapeHtml(d.AvailableReturnAmount)} ₸` : null,
+      ],
+      ['Тип возврата', escapeHtml(d.PossibleReturnType || '') || null],
+      ['Чек', receiptHref ? `<a href="${escapeHtml(receiptHref)}" target="_blank" rel="noopener noreferrer">Открыть</a>` : null],
     ];
     for (const [label, value] of fields) {
       if (value != null)
-        rows += `<div class="detail-row"><span class="detail-label">${label}</span><span class="detail-value">${value}</span></div>`;
+        rows += `<div class="detail-row"><span class="detail-label">${escapeHtml(label)}</span><span class="detail-value">${value}</span></div>`;
     }
     // Returns history
     if (d.Returns && d.Returns.length) {
       rows += '<div style="margin-top:12px;font-weight:600;font-size:14px;">Возвраты:</div>';
       for (const r of d.Returns) {
-        rows += `<div class="detail-row"><span class="detail-label">${r.Date || ''}</span><span class="detail-value" style="color:#c62828;">${r.Amount} ₸</span></div>`;
+        rows += `<div class="detail-row"><span class="detail-label">${escapeHtml(r.Date || '')}</span><span class="detail-value" style="color:#c62828;">${escapeHtml(r.Amount)} ₸</span></div>`;
       }
     }
     content.innerHTML = rows || '<p style="color:#888;">Нет данных</p>';
@@ -731,8 +726,4 @@ Object.assign(window, {
 
 (() => {
   setAuthStep(1);
-  const session = getSession();
-  if (session.tokenSN && session.vtokenSecret) {
-    showMainScreen(session);
-  }
 })();

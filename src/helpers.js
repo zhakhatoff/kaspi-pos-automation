@@ -45,32 +45,115 @@ export const extractUserToken = (resp) => {
 
 // ─── Logged fetch wrapper ───
 
+const KASPI_FETCH_TIMEOUT_MS = Number(process.env.KASPI_FETCH_TIMEOUT_MS) || 25000;
+const VERBOSE = process.env.KASPI_VERBOSE_LOGS === '1' || process.env.NODE_ENV !== 'production';
+
+const SENSITIVE_HEADERS = new Set([
+  'cookie',
+  'x-sign',
+  'x-kb-tokensn',
+  'x-kb-tokensnmac',
+  'x-su',
+  'authorization',
+]);
+
+const SENSITIVE_BODY_KEYS = new Set([
+  'userOtp',
+  'phoneNumber',
+  'PhoneNumber',
+  'pinHash',
+  'x509',
+  'X509',
+  'vtokenSecret',
+  'tokenSN',
+  'TokenSn',
+  'sign',
+]);
+
+const maskString = (s) => {
+  if (typeof s !== 'string' || s.length <= 4) return '***';
+  return s.slice(0, 2) + '***' + s.slice(-2);
+};
+
+const maskHeaders = (headers) => {
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) {
+    out[k] = SENSITIVE_HEADERS.has(k.toLowerCase()) && typeof v === 'string' ? maskString(v) : v;
+  }
+  return out;
+};
+
+const maskBody = (value) => {
+  if (Array.isArray(value)) return value.map(maskBody);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (SENSITIVE_BODY_KEYS.has(k)) {
+        out[k] = typeof v === 'string' ? maskString(v) : '***';
+      } else {
+        out[k] = maskBody(v);
+      }
+    }
+    return out;
+  }
+  return value;
+};
+
+// node-fetch 2 has no default timeout and its .clone() teed body dead-locks
+// on responses larger than the internal PassThrough highWaterMark (~16 KB).
+// Read the body once via .text() and JSON.parse to avoid both.
 export const loggedFetch = async (url, options = {}) => {
   const method = (options.method || 'GET').toUpperCase();
-  console.log(`\n>>> ${method} ${url}`);
-  if (options.headers) console.log('>>> Headers:', JSON.stringify(options.headers, null, 2));
-  if (options.body) {
-    try {
-      console.log('>>> Body:', JSON.parse(options.body));
-    } catch {
-      console.log('>>> Body:', options.body);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), KASPI_FETCH_TIMEOUT_MS);
+  const finalOptions = { ...options, signal: options.signal || controller.signal };
+
+  if (VERBOSE) {
+    console.log(`\n>>> ${method} ${url}`);
+    if (options.headers) console.log('>>> Headers:', JSON.stringify(maskHeaders(options.headers), null, 2));
+    if (options.body) {
+      try {
+        console.log('>>> Body:', maskBody(JSON.parse(options.body)));
+      } catch {
+        console.log('>>> Body:', '[non-json body]');
+      }
     }
   }
 
-  const resp = await fetch(url, options);
-  const cloned = resp.clone();
-  let body;
+  let resp;
   try {
-    body = await cloned.json();
-  } catch {
-    try {
-      body = await cloned.text();
-    } catch {
-      body = '[unreadable]';
-    }
+    resp = await fetch(url, finalOptions);
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === 'AbortError') throw new Error(`kaspi_timeout: ${method} ${url} exceeded ${KASPI_FETCH_TIMEOUT_MS}ms`);
+    throw err;
   }
-  console.log(`<<< ${resp.status} ${resp.statusText}`);
-  console.log('<<< Response:', typeof body === 'object' ? JSON.stringify(body, null, 2) : body);
+
+  let text;
+  try {
+    text = await resp.text();
+  } finally {
+    clearTimeout(timer);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = text;
+  }
+
+  if (VERBOSE) {
+    console.log(`<<< ${resp.status} ${resp.statusText}`);
+    console.log(
+      '<<< Response:',
+      typeof parsed === 'object' ? JSON.stringify(maskBody(parsed), null, 2) : String(parsed).slice(0, 500),
+    );
+  }
+
+  // Preserve the resp.json()/resp.text() contract for existing callers.
+  resp.json = async () => (typeof parsed === 'object' && parsed !== null ? parsed : JSON.parse(text));
+  resp.text = async () => text;
   return resp;
 };
 
